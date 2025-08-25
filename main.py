@@ -10,6 +10,7 @@ from config import BOT_TOKEN
 import mimetypes
 import shutil
 import random
+import pickle
 
 # Store chat data
 active_chats = {}
@@ -18,6 +19,12 @@ console_lock = threading.Lock()
 current_display = "main"  # Track what's currently displayed
 refresh_needed = False  # Flag to indicate if display needs refresh
 pending_deletions = []  # Track messages scheduled for deletion
+chat_history = {}  # Store complete chat history
+
+# Global settings
+message_timer = {'image': 0, 'text': 0}  # Default no timer
+auto_delete = False
+save_history = True  # Enable chat history saving
 
 def clear_console():
     """Clear the console screen"""
@@ -55,6 +62,7 @@ def display_main_interface():
         print("║ Type /ids to show only chat IDs                               ║")
         print("║ Type /delete to delete a chat                                 ║")
         print("║ Type /settings to change message settings                     ║")
+        print("║ Type /history to view chat history                            ║")
         print("╚══════════════════════════════════════════════════════════════╝")
         print()
         
@@ -83,6 +91,7 @@ def display_ids_only():
         print("╔════════════════════ CHAT IDs ════════════════════╗")
         print("║ Type /back to return to main screen              ║")
         print("║ Type /delete to delete a chat                    ║")
+        print("║ Type /history to view chat history               ║")
         print("╚══════════════════════════════════════════════════╝")
         print()
         
@@ -114,6 +123,7 @@ def display_chat_interface(chat_id):
         print("║ Type /back to return, /refresh to refresh, /clear to clear  ║")
         print("║ Type /delete to delete this chat, /dmsg to delete messages  ║")
         print("║ Type /image to send photo, /timer to set timer for messages ║")
+        print("║ Type /history to view complete chat history                 ║")
         print("╚══════════════════════════════════════════════════════════════╝")
         print()
         
@@ -144,6 +154,55 @@ def display_chat_interface(chat_id):
         print("Type your message or command:")
         refresh_needed = False
 
+def display_chat_history(chat_id):
+    """Display complete chat history for a specific chat"""
+    global refresh_needed
+    with console_lock:
+        clear_console()
+        chat = active_chats[chat_id]
+        
+        # Load complete history if available
+        all_messages = chat_history.get(chat_id, []) + chat['messages']
+        
+        print(f"╔════════════════ CHAT HISTORY - {chat['name'].upper()} ═════════════════╗")
+        print(f"║ ID: {chat_id}                                                  ║")
+        print("║ Type /back to return to chat                                  ║")
+        print("║ Use ↑/↓ arrows to scroll, /search to find messages            ║")
+        print("╚══════════════════════════════════════════════════════════════╝")
+        print()
+        
+        if not all_messages:
+            print("No message history available.")
+            print("\nType /back to return:")
+            return
+        
+        # Display all messages with date headers
+        current_date = None
+        for msg in all_messages:
+            msg_date = msg['time'].strftime("%Y-%m-%d")
+            if msg_date != current_date:
+                current_date = msg_date
+                print(f"\n📅 {msg['time'].strftime('%B %d, %Y')}")
+                print("─" * 40)
+            
+            timestamp = msg['time'].strftime("%H:%M")
+            seen_indicator = " ✓✓" if msg.get('seen') else " ✓" if msg['direction'] == 'outgoing' else ""
+            
+            if msg['direction'] == 'incoming':
+                if msg['type'] == 'text':
+                    print(f"{timestamp} {chat['name']}: {msg['text']}{seen_indicator}")
+                elif msg['type'] == 'image':
+                    print(f"{timestamp} {chat['name']}: [Image: {msg.get('filename', 'photo')}] 📸{seen_indicator}")
+            else:
+                if msg['type'] == 'text':
+                    print(f"{timestamp} You: {msg['text']}{seen_indicator}")
+                elif msg['type'] == 'image':
+                    print(f"{timestamp} You: [Image: {msg.get('filename', 'photo')}] 📸{seen_indicator}")
+        
+        print("\n─" * 60)
+        print("Type /back to return to chat:")
+        refresh_needed = False
+
 def delete_chat_interface():
     """Display interface for deleting a chat"""
     global refresh_needed
@@ -151,6 +210,7 @@ def delete_chat_interface():
         clear_console()
         print("╔════════════════════ DELETE CHAT ════════════════════╗")
         print("║ Type /back to return to main screen                 ║")
+        print("║ Type /history to view chat history                  ║")
         print("╚═════════════════════════════════════════════════════╝")
         print()
         
@@ -180,6 +240,7 @@ def delete_message_interface(chat_id):
         print(f"║ ID: {chat_id}                                                  ║")
         print("║ Type /back to return to chat                                  ║")
         print("║ Type /all to delete all messages                              ║")
+        print("║ Type /history to view chat history                            ║")
         print("╚══════════════════════════════════════════════════════════════╝")
         print()
         
@@ -216,6 +277,7 @@ def settings_interface():
         print("║ 1. Set default timer for images (seconds)         ║")
         print("║ 2. Set default timer for messages (seconds)       ║")
         print("║ 3. Enable/disable auto-delete after sending       ║")
+        print("║ 4. Enable/disable chat history saving             ║")
         print("╚═══════════════════════════════════════════════════╝")
         print()
         
@@ -224,14 +286,11 @@ def settings_interface():
         print(f"Image Timer: {message_timer.get('image', 0)} seconds")
         print(f"Message Timer: {message_timer.get('text', 0)} seconds")
         print(f"Auto Delete: {'Enabled' if auto_delete else 'Disabled'}")
+        print(f"Save History: {'Enabled' if save_history else 'Disabled'}")
         print("─" * 40)
         
         print("\nEnter option number to change or /back to return:")
         refresh_needed = False
-
-# Global settings
-message_timer = {'image': 0, 'text': 0}  # Default no timer
-auto_delete = False
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming messages"""
@@ -247,6 +306,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'username': user.username,
             'messages': []
         }
+    
+    # Create message data
+    message_data = {
+        'time': timestamp,
+        'direction': 'incoming'
+    }
     
     # Check if message contains photo
     if update.message.photo:
@@ -268,44 +333,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Download the file
         await file.download_to_drive(local_path)
         
-        # Add image message to chat history
-        active_chats[chat_id]['messages'].append({
+        # Add image data to message
+        message_data.update({
             'type': 'image',
             'filename': filename,
-            'local_path': local_path,
-            'time': timestamp,
-            'direction': 'incoming',
-            'read': False
-        })
-        
-        # Add to message queue for display
-        message_queue.append({
-            'type': 'image',
-            'chat_id': chat_id,
-            'filename': filename,
-            'local_path': local_path,
-            'name': active_chats[chat_id]['name'],
-            'time': timestamp
+            'local_path': local_path
         })
         
     else:
-        # Add text message to chat history
-        active_chats[chat_id]['messages'].append({
+        # Add text data to message
+        message_data.update({
             'type': 'text',
-            'text': update.message.text,
-            'time': timestamp,
-            'direction': 'incoming',
-            'read': False
+            'text': update.message.text
         })
-        
-        # Add to message queue for display
-        message_queue.append({
-            'type': 'message',
-            'chat_id': chat_id,
-            'text': update.message.text,
-            'name': active_chats[chat_id]['name'],
-            'time': timestamp
-        })
+    
+    # Add to chat history
+    active_chats[chat_id]['messages'].append(message_data)
+    
+    # Save to permanent history if enabled
+    if save_history:
+        if chat_id not in chat_history:
+            chat_history[chat_id] = []
+        chat_history[chat_id].append(message_data)
+    
+    # Add to message queue for display
+    queue_data = {
+        'type': 'image' if update.message.photo else 'message',
+        'chat_id': chat_id,
+        'name': active_chats[chat_id]['name'],
+        'time': timestamp
+    }
+    
+    if update.message.photo:
+        queue_data['filename'] = filename
+        queue_data['local_path'] = local_path
+    else:
+        queue_data['text'] = update.message.text
+    
+    message_queue.append(queue_data)
 
     # --- Auto-reply section ---
     auto_replies = {
@@ -324,13 +389,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = requests.post(url, data=data)
 
             if response.status_code == 200:
-                # Add auto-reply to chat history
-                active_chats[chat_id]['messages'].append({
+                # Create reply message data
+                reply_data = {
                     'type': 'text',
                     'text': reply,
                     'time': datetime.now(),
                     'direction': 'outgoing'
-                })
+                }
+                
+                # Add to chat history
+                active_chats[chat_id]['messages'].append(reply_data)
+                
+                # Save to permanent history if enabled
+                if save_history:
+                    if chat_id not in chat_history:
+                        chat_history[chat_id] = []
+                    chat_history[chat_id].append(reply_data)
                 
                 # Add to message queue for display
                 message_queue.append({
@@ -359,15 +433,25 @@ def send_message_with_timer(chat_id, text, is_image=False):
             
             if response.status_code == 200:
                 message_id = response_data['result']['message_id']
-                # Add to chat history
-                active_chats[chat_id]['messages'].append({
+                # Create message data
+                message_data = {
                     'type': 'image',
                     'filename': os.path.basename(text),
                     'time': datetime.now(),
                     'direction': 'outgoing',
                     'message_id': message_id,
-                    'seen': False  # Track if message has been seen
-                })
+                    'seen': False
+                }
+                
+                # Add to chat history
+                active_chats[chat_id]['messages'].append(message_data)
+                
+                # Save to permanent history if enabled
+                if save_history:
+                    if chat_id not in chat_history:
+                        chat_history[chat_id] = []
+                    chat_history[chat_id].append(message_data)
+                
                 return True, message_id
         else:
             # Send text message
@@ -379,15 +463,25 @@ def send_message_with_timer(chat_id, text, is_image=False):
             
             if response.status_code == 200:
                 message_id = response_data['result']['message_id']
-                # Add to chat history
-                active_chats[chat_id]['messages'].append({
+                # Create message data
+                message_data = {
                     'type': 'text',
                     'text': text,
                     'time': datetime.now(),
                     'direction': 'outgoing',
                     'message_id': message_id,
-                    'seen': False  # Track if message has been seen
-                })
+                    'seen': False
+                }
+                
+                # Add to chat history
+                active_chats[chat_id]['messages'].append(message_data)
+                
+                # Save to permanent history if enabled
+                if save_history:
+                    if chat_id not in chat_history:
+                        chat_history[chat_id] = []
+                    chat_history[chat_id].append(message_data)
+                
                 return True, message_id
         
         return False, None
@@ -505,6 +599,11 @@ def process_message_queue():
                         print(f"\n[{timestamp}] New message from ID: {msg['chat_id']}:")
                         print(f"→ {msg['text']}")
                         print("\nEnter message number to delete, /all to delete all, or /back to return:")
+                    elif isinstance(current_display, tuple) and current_display[0] == "history":
+                        # Show notification on history screen
+                        print(f"\n[{timestamp}] New message from ID: {msg['chat_id']}:")
+                        print(f"→ {msg['text']}")
+                        print("\nType /back to return to chat:")
                     else:
                         # If we're in a chat, show notification even if it's from another user
                         if current_display == msg['chat_id']:
@@ -550,6 +649,12 @@ def process_message_queue():
                         print(f"→ Image saved as: {msg['filename']}")
                         display_image_notification(msg['local_path'], f"ID: {msg['chat_id']}")
                         print("\nEnter message number to delete, /all to delete all, or /back to return:")
+                    elif isinstance(current_display, tuple) and current_display[0] == "history":
+                        # Show image notification on history screen
+                        print(f"\n[{timestamp}] 📸 New image from ID: {msg['chat_id']}")
+                        print(f"→ Image saved as: {msg['filename']}")
+                        display_image_notification(msg['local_path'], f"ID: {msg['chat_id']}")
+                        print("\nType /back to return to chat:")
                     else:
                         # If we're in a chat, show image notification
                         if current_display == msg['chat_id']:
@@ -578,6 +683,8 @@ def process_message_queue():
                 settings_interface()
             elif isinstance(current_display, tuple) and current_display[0] == "dmsg":
                 delete_message_interface(current_display[1])
+            elif isinstance(current_display, tuple) and current_display[0] == "history":
+                display_chat_history(current_display[1])
             else:
                 display_chat_interface(current_display)
         
@@ -585,7 +692,7 @@ def process_message_queue():
 
 def console_interface(app: Application):
     """Handle console input for replying to messages"""
-    global current_display, refresh_needed, message_timer, auto_delete
+    global current_display, refresh_needed, message_timer, auto_delete, save_history
     
     time.sleep(1)  # Wait for bot to initialize
     
@@ -606,6 +713,8 @@ def console_interface(app: Application):
                     settings_interface()
                 elif isinstance(current_display, tuple) and current_display[0] == "dmsg":
                     delete_message_interface(current_display[1])
+                elif isinstance(current_display, tuple) and current_display[0] == "history":
+                    display_chat_history(current_display[1])
                 else:
                     display_chat_interface(current_display)
             
@@ -613,6 +722,14 @@ def console_interface(app: Application):
             
             if user_input.lower() == '/exit':
                 print("Goodbye!")
+                # Save chat history before exiting
+                if save_history:
+                    try:
+                        with open("chat_history.pkl", "wb") as f:
+                            pickle.dump(chat_history, f)
+                        print("Chat history saved successfully")
+                    except Exception as e:
+                        print(f"Error saving chat history: {e}")
                 os._exit(0)
                 
             elif user_input.lower() == '/refresh':
@@ -626,6 +743,8 @@ def console_interface(app: Application):
                     settings_interface()
                 elif isinstance(current_display, tuple) and current_display[0] == "dmsg":
                     delete_message_interface(current_display[1])
+                elif isinstance(current_display, tuple) and current_display[0] == "history":
+                    display_chat_history(current_display[1])
                 else:
                     display_chat_interface(current_display)
                 continue
@@ -642,6 +761,8 @@ def console_interface(app: Application):
                     settings_interface()
                 elif isinstance(current_display, tuple) and current_display[0] == "dmsg":
                     delete_message_interface(current_display[1])
+                elif isinstance(current_display, tuple) and current_display[0] == "history":
+                    display_chat_history(current_display[1])
                 else:
                     display_chat_interface(current_display)
                 continue
@@ -678,6 +799,21 @@ def console_interface(app: Application):
                         display_main_interface()
                 continue
                 
+            elif user_input.lower() == '/history':
+                if current_display == "main":
+                    print("Please enter a chat first to view history.")
+                    time.sleep(1)
+                    display_main_interface()
+                elif isinstance(current_display, int) and current_display in active_chats:
+                    display_chat_history(current_display)
+                    current_display = ("history", current_display)
+                else:
+                    print("Please enter a chat first to view history.")
+                    time.sleep(1)
+                    if current_display == "main":
+                        display_main_interface()
+                continue
+                
             # Handle settings changes
             elif current_display == "settings" and user_input.isdigit():
                 option = int(user_input)
@@ -706,6 +842,11 @@ def console_interface(app: Application):
                     print(f"Auto-delete {'enabled' if auto_delete else 'disabled'}")
                     time.sleep(1)
                     settings_interface()
+                elif option == 4:
+                    save_history = not save_history
+                    print(f"History saving {'enabled' if save_history else 'disabled'}")
+                    time.sleep(1)
+                    settings_interface()
                 else:
                     print("Invalid option")
                     time.sleep(1)
@@ -725,6 +866,9 @@ def console_interface(app: Application):
                     confirm = input(f"Are you sure you want to delete chat with {chat_name}? (y/N): ").strip().lower()
                     if confirm == 'y':
                         del active_chats[chat_id_to_delete]
+                        # Also delete from history if exists
+                        if chat_id_to_delete in chat_history:
+                            del chat_history[chat_id_to_delete]
                         print(f"Chat with {chat_name} (ID: {chat_id_to_delete}) has been deleted.")
                         time.sleep(2)
                         
@@ -740,7 +884,7 @@ def console_interface(app: Application):
                     delete_chat_interface()
                 continue
                 
-            # Handle message deletion - FIXED SECTION
+            # Handle message deletion
             elif isinstance(current_display, tuple) and current_display[0] == "dmsg":
                 chat_id = current_display[1]
                 
@@ -784,6 +928,17 @@ def console_interface(app: Application):
                     time.sleep(1)
                     delete_message_interface(chat_id)
                 continue
+                
+            # Handle history view
+            elif isinstance(current_display, tuple) and current_display[0] == "history":
+                if user_input.lower() == '/back':
+                    display_chat_interface(current_display[1])
+                    current_display = current_display[1]
+                else:
+                    print("Type /back to return to chat")
+                    time.sleep(1)
+                    display_chat_history(current_display[1])
+                continue
                     
             # Check if we're in the main screen and input is a chat ID
             elif current_display == "main" and user_input.isdigit():
@@ -806,6 +961,9 @@ def console_interface(app: Application):
                     confirm = input(f"Are you sure you want to delete chat with {chat_name}? (y/N): ").strip().lower()
                     if confirm == 'y':
                         del active_chats[chat_id]
+                        # Also delete from history if exists
+                        if chat_id in chat_history:
+                            del chat_history[chat_id]
                         print(f"Chat with {chat_name} has been deleted.")
                         time.sleep(2)
                         
@@ -820,6 +978,11 @@ def console_interface(app: Application):
                     # Delete messages in current chat
                     delete_message_interface(chat_id)
                     current_display = ("dmsg", chat_id)
+                    
+                elif user_input.lower() == '/history':
+                    # View chat history
+                    display_chat_history(chat_id)
+                    current_display = ("history", chat_id)
                     
                 elif user_input.lower() == '/image':
                     image_path = input("Enter the path to the image: ").strip()
@@ -944,6 +1107,8 @@ def console_interface(app: Application):
                 settings_interface()
             elif isinstance(current_display, tuple) and current_display[0] == "dmsg":
                 delete_message_interface(current_display[1])
+            elif isinstance(current_display, tuple) and current_display[0] == "history":
+                display_chat_history(current_display[1])
             else:
                 display_chat_interface(current_display)
 
@@ -953,10 +1118,21 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_message))
     
-    print("Starting Telegram Messenger with advanced features...")
+    print("Starting Telegram Messenger with Chat History...")
     
     # Create directory for downloaded images
     os.makedirs("downloaded_images", exist_ok=True)
+    
+    # Load existing chat history if available
+    global chat_history
+    try:
+        if os.path.exists("chat_history.pkl"):
+            with open("chat_history.pkl", "rb") as f:
+                chat_history = pickle.load(f)
+            print(f"Loaded chat history for {len(chat_history)} chats")
+    except:
+        print("Could not load chat history")
+        chat_history = {}
     
     # Start message processing thread
     threading.Thread(target=process_message_queue, daemon=True).start()
@@ -971,7 +1147,18 @@ def main():
     threading.Thread(target=console_interface, args=(app,), daemon=True).start()
     
     # Start the bot
-    app.run_polling()
+    try:
+        app.run_polling()
+    except KeyboardInterrupt:
+        # Save chat history before exiting
+        if save_history:
+            try:
+                with open("chat_history.pkl", "wb") as f:
+                    pickle.dump(chat_history, f)
+                print("Chat history saved successfully")
+            except Exception as e:
+                print(f"Error saving chat history: {e}")
+        print("Goodbye!")
 
 if __name__ == "__main__":
     main()
